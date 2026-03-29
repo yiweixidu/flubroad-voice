@@ -15,3 +15,7 @@ class Config:
     # 新增
     ENABLE_BIORXIV = os.getenv("ENABLE_BIORXIV", "true").lower() == "true"
     # ENABLE_EUROPE_PMC = os.getenv("ENABLE_EUROPE_PMC", "false").lower() == "true"
+
+    # 全文检索配置
+    PMC_CACHE_DIR = os.getenv("PMC_CACHE_DIR", "./data/pmc_cache")
+    UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL")
