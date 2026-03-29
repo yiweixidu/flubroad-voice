@@ -1,0 +1,16 @@
+biopython
+langchain
+langchain-openai
+langchain-community
+langchain-text-splitters
+chromadb
+python-pptx
+edge-tts
+moviepy==1.0.3   # 指定版本以确保兼容
+python-dotenv
+pydantic
+fastapi
+uvicorn
+gradio
+openai
+pdf2image         # 用于 PPT 转图片
