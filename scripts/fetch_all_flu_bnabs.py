@@ -3,7 +3,7 @@ import os
 
 def main():
     email = os.getenv("EMAIL", "yiweixidu@gmail.com")
-    api_key = os.getenv("0c2a57b91a4503e808d45c2619b978b36808")
+    api_key = os.getenv("PUBMED_API_KEY")
     
     # 使用已经验证的查询（不带字段限定符，日期过滤将由 search_all_requests 自动添加）
     query = '("broadly neutralizing antibody" OR bnAb OR "cross-reactive antibody") AND (influenza OR flu OR H1N1 OR H3N2 OR hemagglutinin)'

@@ -60,7 +60,7 @@ class PPTGenerator:
         slide = self.prs.slides.add_slide(slide_layout)
         left = Inches(1)
         top = Inches(1.5)
-        pic = slide.shapes.add_picture(img_bytes, left, top, height=Inches(5))
+        slide.shapes.add_picture(img_bytes, left, top, height=Inches(5))
         # 添加标题（可选）
         title_box = slide.shapes.add_textbox(left, Inches(0.5), Inches(8), Inches(1))
         title_box.text = title

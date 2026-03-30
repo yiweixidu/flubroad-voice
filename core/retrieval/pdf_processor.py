@@ -1,131 +1,101 @@
 """
-PDF 文档处理模块
-支持：用户上传 PDF、文本提取、分块与索引
+core/retrieval/pdf_processor.py
+Fix: removed unused PyPDF2 import (pdfplumber handles everything).
 """
-import tempfile
+
 from pathlib import Path
 from typing import List, Dict, Optional, BinaryIO
 
 import pdfplumber
-import PyPDF2
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 class PDFProcessor:
-    """PDF 处理器 - 提取文本并准备 RAG 索引 [citation:6]"""
-    
+    """Extract text from PDFs and prepare LangChain Documents for RAG indexing."""
+
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", " ", ""]
+            separators=["\n\n", "\n", " ", ""],
         )
-    
+
+    # ── Text extraction ───────────────────────────────────────────────────────
     def extract_text_from_pdf(self, pdf_file: BinaryIO) -> Dict:
-        """
-        从 PDF 文件提取文本
-        使用 pdfplumber 获得更好的布局保留 [citation:6]
-        """
+        """Extract full text, per-page text, and tables from a PDF file object."""
         text_by_page = []
-        full_text = []
+        full_text_parts = []
+        tables = []
         metadata = {}
-        
+
         with pdfplumber.open(pdf_file) as pdf:
-            # 提取元数据
             metadata = {
-                "pages": len(pdf.pages),
-                "metadata": pdf.metadata
+                "pages":    len(pdf.pages),
+                "metadata": pdf.metadata or {},
             }
-            
-            # 逐页提取
             for page_num, page in enumerate(pdf.pages, 1):
                 page_text = page.extract_text() or ""
-                text_by_page.append({
-                    "page": page_num,
-                    "text": page_text
-                })
-                full_text.append(page_text)
-            
-            # 尝试提取表格
-            tables = []
-            for page in pdf.pages:
+                text_by_page.append({"page": page_num, "text": page_text})
+                full_text_parts.append(page_text)
                 page_tables = page.extract_tables()
                 if page_tables:
                     tables.extend(page_tables)
-        
+
         return {
-            "full_text": "\n\n".join(full_text),
+            "full_text":   "\n\n".join(full_text_parts),
             "text_by_page": text_by_page,
-            "metadata": metadata,
-            "tables": tables,
-            "total_pages": metadata["pages"]
+            "metadata":    metadata,
+            "tables":      tables,
+            "total_pages": metadata["pages"],
         }
-    
-    def process_uploaded_pdf(self, pdf_file: BinaryIO, filename: str) -> List[Document]:
-        """
-        处理上传的 PDF，生成 LangChain Document 对象
-        用于后续 RAG 知识库构建
-        """
-        # 提取文本
+
+    # ── Process for RAG ───────────────────────────────────────────────────────
+    def process_uploaded_pdf(
+        self, pdf_file: BinaryIO, filename: str
+    ) -> List[Document]:
+        """Extract text, split into chunks, return LangChain Documents."""
         extracted = self.extract_text_from_pdf(pdf_file)
-        
-        # 创建 Document
         doc = Document(
             page_content=extracted["full_text"],
             metadata={
-                "source": filename,
-                "type": "user_uploaded_pdf",
+                "source":      filename,
+                "type":        "user_uploaded_pdf",
                 "total_pages": extracted["total_pages"],
-                "has_tables": len(extracted["tables"]) > 0
-            }
+                "has_tables":  len(extracted["tables"]) > 0,
+            },
         )
-        
-        # 分块
         chunks = self.text_splitter.split_documents([doc])
-        
-        # 为每个块添加页面位置信息
         for i, chunk in enumerate(chunks):
-            chunk.metadata["chunk_id"] = i
+            chunk.metadata["chunk_id"]   = i
             chunk.metadata["chunk_size"] = len(chunk.page_content)
-        
         return chunks
-    
+
+    # ── Table extraction ──────────────────────────────────────────────────────
     def extract_tables_as_markdown(self, pdf_file: BinaryIO) -> str:
-        """提取表格并转换为 Markdown 格式"""
+        """Extract all tables from a PDF and return them as Markdown."""
         markdown_tables = []
-        
         with pdfplumber.open(pdf_file) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
-                tables = page.extract_tables()
-                for table in tables:
-                    if table and len(table) > 0:
-                        # 转换为 Markdown 表格
-                        md_table = self._table_to_markdown(table)
-                        markdown_tables.append(f"<!-- Page {page_num} -->\n{md_table}")
-        
+                for table in page.extract_tables() or []:
+                    if table:
+                        md = self._table_to_markdown(table)
+                        markdown_tables.append(f"<!-- Page {page_num} -->\n{md}")
         return "\n\n".join(markdown_tables)
-    
-    def _table_to_markdown(self, table: List[List]) -> str:
-        """将表格转换为 Markdown 格式"""
-        if not table or len(table) == 0:
+
+    @staticmethod
+    def _table_to_markdown(table: List[List]) -> str:
+        if not table:
             return ""
-        
         headers = [str(cell or "") for cell in table[0]]
-        rows = table[1:]
-        
-        # 构建 Markdown 表格
+        separator = "|" + "|".join(" --- " for _ in headers) + "|"
         header_line = "| " + " | ".join(headers) + " |"
-        separator_line = "|" + "|".join([" --- " for _ in headers]) + "|"
         body_lines = []
-        
-        for row in rows:
+        for row in table[1:]:
             cells = [str(cell or "") for cell in row]
-            # 确保列数匹配
             while len(cells) < len(headers):
                 cells.append("")
             body_lines.append("| " + " | ".join(cells) + " |")
-        
-        return "\n".join([header_line, separator_line] + body_lines)
+        return "\n".join([header_line, separator] + body_lines)

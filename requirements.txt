@@ -16,8 +16,6 @@ openai
 pdf2image         # 用于 PPT 转图片
 
 # 全文获取与解析
-pyeuropepmc>=1.13.0          # Europe PMC 完整功能 [citation:1]
-pmc-downloader>=0.1.0        # PMC 下载工具 [citation:4]
-unpywall>=0.2.3              # Unpaywall Python 客户端 [citation:5]
+langchain-huggingface
 pdfplumber>=0.10.0           # PDF 文本提取 [citation:6]
 PyMuPDF>=1.23.0              # 备选 PDF 解析器

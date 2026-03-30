@@ -31,7 +31,9 @@ Question: {question}
 
 Answer:"""
     
-    response = llm.llm.invoke(prompt)  # 直接调用底层 LLM
+    from langchain_core.messages import HumanMessage
+    response = llm.llm.invoke([HumanMessage(content=prompt)])
+
     print(f"Question: {question}\n")
     print(f"Answer: {response}")
     

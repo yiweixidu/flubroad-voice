@@ -1,149 +1,215 @@
 """
-PMC 全文检索与下载模块
-支持：PMC ID 全文下载、XML 解析、文本提取
+core/retrieval/pmc_fulltext.py  —  complete rewrite
+Dependencies: requests, pdfplumber (already in requirements)
+No pyeuropepmc / pmc_downloader / unpywall needed.
+
+Priority chain for each article:
+  1. PMC full-text XML  (via Europe PMC REST API — free, no auth)
+  2. Unpaywall OA PDF   (download + pdfplumber text extraction)
+  3. Abstract only      (fallback, always available)
 """
-import os
-from typing import List, Dict, Optional
-from pathlib import Path
 
-from pyeuropepmc import SearchClient, FullTextClient, FullTextXMLParser
-from pyeuropepmc.ftp_downloader import FTPDownloader
-from pmc_downloader import PMCDownloader
+import io
+import time
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Optional
 
+import pdfplumber
+import requests
+
+
+# ── Europe PMC full-text ───────────────────────────────────────────────────────
 
 class PMCFulltextFetcher:
-    """PMC 全文获取器 - 支持 XML/PDF 下载与解析"""
-    
-    def __init__(self, email: str, api_key: Optional[str] = None, 
-                 output_dir: str = "./data/pmc_cache"):
-        self.email = email
-        self.api_key = api_key
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-    def search_by_pmcid(self, pmcid: str) -> Dict:
-        """
-        通过 PMCID 搜索文献详细信息
-        使用 pyeuropepmc 的全文客户端 [citation:1]
-        """
-        with FullTextClient() as client:
-            # 下载 XML 全文
-            xml_path = client.download_xml_by_pmcid(pmcid, output_dir=self.output_dir)
-            
-            # 解析 XML 提取结构化内容
-            with open(xml_path, 'r') as f:
-                parser = FullTextXMLParser(f.read())
-            
-            # 提取各类内容
-            return {
-                "metadata": parser.extract_metadata(),
-                "plaintext": parser.to_plaintext(),
-                "markdown": parser.to_markdown(),
-                "tables": parser.extract_tables(),
-                "references": parser.extract_references(),
-                "xml_path": str(xml_path)
-            }
-    
-    def search_by_query(self, query: str, max_results: int = 50) -> List[Dict]:
-        """
-        通过查询检索 PMC 全文文献
-        使用 Europe PMC 高级搜索 API [citation:1]
-        """
-        from pyeuropepmc import QueryBuilder
-        
-        # 构建查询（仅限开放获取全文）
-        qb = QueryBuilder()
-        full_query = (qb
-            .keyword(query)
-            .and_()
-            .keyword("open access", field="ACC")
-            .build())
-        
-        with SearchClient() as client:
-            # 搜索并自动解析结果
-            papers = client.search_and_parse(
-                query=full_query,
-                pageSize=max_results,
-                sort="cited desc"
-            )
-            
-            # 对每篇文献获取全文
-            results = []
-            for paper in papers:
-                pmcid = paper.get('pmcid')
-                if pmcid:
-                    try:
-                        full_content = self.search_by_pmcid(pmcid)
-                        results.append({
-                            **paper,
-                            "fulltext": full_content
-                        })
-                    except Exception as e:
-                        print(f"Failed to get fulltext for {pmcid}: {e}")
-                        results.append(paper)
-            
-            return results
-    
-    def batch_download(self, pmcids: List[str]) -> Dict:
-        """
-        批量下载 PMC 文献
-        使用 FTP 批量下载提高效率 [citation:1]
-        """
-        ftp_downloader = FTPDownloader()
-        results = ftp_downloader.bulk_download_and_extract(
-            pmcids=pmcids,
-            output_dir=str(self.output_dir / "bulk")
-        )
-        return results
+    """
+    Fetches article full text from Europe PMC's REST API.
 
+    API endpoint (no auth required for open-access articles):
+      GET https://www.ebi.ac.uk/europepmc/webservices/rest/{PMCID}/fullTextXML
+    """
 
-class UnpaywallIntegration:
-    """Unpaywall 集成 - 自动查找合法全文链接 [citation:5]"""
-    
-    def __init__(self, email: str):
+    BASE_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+    SEARCH_URL = f"{BASE_URL}/search"
+
+    def __init__(self, email: str, delay: float = 0.5):
         self.email = email
-        # 设置认证
-        from unpywall.utils import UnpywallCredentials
-        UnpywallCredentials(email)
-        
-    def get_fulltext_url(self, doi: str) -> Optional[str]:
-        """通过 DOI 获取开放获取全文 URL"""
-        from unpywall import Unpywall
-        
-        try:
-            # 获取 PDF 链接
-            pdf_url = Unpywall.get_pdf_link(doi=doi)
-            if pdf_url:
-                return pdf_url
-            
-            # 备选：获取文档链接
-            doc_url = Unpywall.get_doc_link(doi=doi)
-            return doc_url
-        except Exception as e:
-            print(f"Unpaywall lookup failed for {doi}: {e}")
+        self.delay = delay          # polite crawl delay between requests
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": f"FluBroadVoice/1.0 ({email})"})
+
+    # ── Main entry: enrich a single article dict ──────────────────────────────
+    def enrich_article(self, article: Dict) -> Dict:
+        """
+        Try to fetch full text for `article`.
+        Returns the article dict with fulltext_* fields populated.
+        Modifies in-place and also returns the dict for convenience.
+        """
+        pmcid = article.get("pmcid", "")
+        if pmcid:
+            try:
+                plaintext = self.fetch_fulltext_by_pmcid(pmcid)
+                if plaintext:
+                    article["fulltext_available"] = True
+                    article["fulltext_content"]   = plaintext
+                    article["fulltext_source"]    = "pmc"
+                    return article
+            except Exception as e:
+                print(f"    [PMC] {pmcid} failed: {e}")
+        return article
+
+    # ── Fetch + parse PMC XML ─────────────────────────────────────────────────
+    def fetch_fulltext_by_pmcid(self, pmcid: str) -> Optional[str]:
+        """
+        Download the NLM/JATS XML from Europe PMC and extract plain text.
+        Returns None if the article is not available as open-access full text.
+        """
+        # Normalise: Europe PMC wants bare numeric ID or "PMCxxxxxxx"
+        pmcid_clean = pmcid.replace("PMC", "")
+        url = f"{self.BASE_URL}/PMC{pmcid_clean}/fullTextXML"
+        time.sleep(self.delay)
+        resp = self.session.get(url, timeout=30)
+        if resp.status_code == 404:
             return None
-    
-    def batch_check(self, dois: List[str]) -> Dict[str, Optional[str]]:
-        """批量检查多个 DOI 的开放获取状态"""
-        from unpywall import Unpywall
-        
-        results = Unpywall.doi(dois=dois, progress=True)
-        return results.to_dict() if results is not None else {}
-    
-    def get_best_oa_location(self, doi: str) -> Dict:
+        resp.raise_for_status()
+        return self._xml_to_plaintext(resp.content)
+
+    @staticmethod
+    def _xml_to_plaintext(xml_bytes: bytes) -> str:
         """
-        获取最佳开放获取位置
-        返回 PDF URL、许可证、版本等信息
+        Extract readable text from JATS/NLM XML.
+        Pulls text from <abstract>, <body>, and <sec> elements,
+        skipping reference lists and figure captions.
         """
-        from unpywall import Unpywall
-        
-        json_data = Unpywall.get_json(doi=doi)
-        if json_data:
-            best_oa = json_data.get('best_oa_location', {})
-            return {
-                "url": best_oa.get('url_for_pdf') or best_oa.get('url'),
-                "version": best_oa.get('version'),
-                "license": best_oa.get('license'),
-                "evidence": best_oa.get('evidence')
-            }
-        return {}
+        SKIP_TAGS = {"ref-list", "fig", "table-wrap", "supplementary-material"}
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return ""
+
+        parts: List[str] = []
+
+        def walk(elem: ET.Element, depth: int = 0) -> None:
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag in SKIP_TAGS:
+                return
+            # Collect direct text
+            if elem.text and elem.text.strip():
+                parts.append(elem.text.strip())
+            for child in elem:
+                walk(child, depth + 1)
+            if elem.tail and elem.tail.strip():
+                parts.append(elem.tail.strip())
+
+        # Focus on abstract + body; fall back to full document
+        abstract = root.find(".//{*}abstract")
+        body      = root.find(".//{*}body")
+        targets   = [t for t in [abstract, body] if t is not None]
+        if not targets:
+            targets = [root]
+        for target in targets:
+            walk(target)
+
+        return " ".join(parts)
+
+    # ── Lookup PMCID from PubMed article (Europe PMC search) ─────────────────
+    def lookup_pmcid(self, pmid: str) -> Optional[str]:
+        """
+        Ask Europe PMC for the PMCID corresponding to a PubMed ID.
+        Useful if PubMed XML didn't include it.
+        """
+        params = {
+            "query": f"EXT_ID:{pmid} AND SRC:MED",
+            "format": "json",
+            "pageSize": 1,
+            "resultType": "core",
+        }
+        try:
+            time.sleep(self.delay)
+            resp = self.session.get(self.SEARCH_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("resultList", {}).get("result", [])
+            if results and results[0].get("pmcid"):
+                return results[0]["pmcid"]
+        except Exception as e:
+            print(f"    [PMC lookup] PMID {pmid}: {e}")
+        return None
+
+
+# ── Unpaywall OA PDF fetcher ───────────────────────────────────────────────────
+
+class UnpaywallFetcher:
+    """
+    Uses the Unpaywall REST API (no library needed) to find an OA PDF URL,
+    then downloads and extracts text with pdfplumber.
+    """
+
+    API_URL = "https://api.unpaywall.org/v2/{doi}"
+
+    def __init__(self, email: str, delay: float = 0.5):
+        self.email = email
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": f"FluBroadVoice/1.0 ({email})"})
+
+    # ── Main entry ────────────────────────────────────────────────────────────
+    def enrich_article(self, article: Dict) -> Dict:
+        """
+        Try to get full text via Unpaywall for `article`.
+        Only called when PMC full text is unavailable.
+        """
+        doi = article.get("doi", "")
+        if not doi:
+            return article
+        try:
+            pdf_url = self.get_pdf_url(doi)
+            if pdf_url:
+                text = self.download_and_extract(pdf_url)
+                if text and len(text) > 500:   # sanity: at least a paragraph
+                    article["fulltext_available"] = True
+                    article["fulltext_content"]   = text
+                    article["fulltext_source"]    = "unpaywall_pdf"
+                    article["oa_url"]             = pdf_url
+        except Exception as e:
+            print(f"    [Unpaywall] DOI {doi}: {e}")
+        return article
+
+    def get_oa_info(self, doi: str) -> Dict:
+        """Return raw Unpaywall JSON for a DOI (useful for the OA lookup tab)."""
+        time.sleep(self.delay)
+        url = self.API_URL.format(doi=doi)
+        resp = self.session.get(url, params={"email": self.email}, timeout=15)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_pdf_url(self, doi: str) -> Optional[str]:
+        """Return the best OA PDF URL for a DOI, or None."""
+        data = self.get_oa_info(doi)
+        if not data or not data.get("is_oa"):
+            return None
+        best = data.get("best_oa_location") or {}
+        return best.get("url_for_pdf") or best.get("url")
+
+    def download_and_extract(self, pdf_url: str, timeout: int = 30) -> str:
+        """Download a PDF and extract its text with pdfplumber."""
+        time.sleep(self.delay)
+        resp = self.session.get(pdf_url, timeout=timeout, stream=True)
+        resp.raise_for_status()
+        # Check content type
+        ct = resp.headers.get("Content-Type", "")
+        if "pdf" not in ct.lower() and not pdf_url.lower().endswith(".pdf"):
+            # Might be HTML — skip
+            return ""
+        pdf_bytes = resp.content
+        parts: List[str] = []
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        parts.append(text)
+        except Exception as e:
+            print(f"    [pdfplumber] extraction failed: {e}")
+        return "\n\n".join(parts)

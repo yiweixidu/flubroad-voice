@@ -1,135 +1,192 @@
 """
-增强版文献检索器
-整合：PubMed 摘要 + PMC 全文 + PDF 上传 + Unpaywall
-"""
-from typing import List, Dict, Optional, BinaryIO
-from pathlib import Path
+core/retrieval/enhanced_fetcher.py  —  complete rewrite
+This is the single module responsible for producing the local article cache
+(data/flu_bnabs_all_articles.json).
 
-from core.retrieval.pubmed import PubMedFetcher
-from core.retrieval.pmc_fulltext import PMCFulltextFetcher, UnpaywallIntegration
-from core.retrieval.pdf_processor import PDFProcessor
+Pipeline:
+  1. PubMed search  → PMIDs
+  2. PubMed efetch  → abstracts + DOI + PMCID
+  3. For each article
+       a. PMCID present? → Europe PMC full-text XML   (PMCFulltextFetcher)
+       b. DOI present?   → Unpaywall OA PDF download  (UnpaywallFetcher)
+       c. else           → keep abstract only
+  4. Save enriched list to a local JSON file
+
+Usage:
+    from core.retrieval.enhanced_fetcher import EnhancedLiteratureFetcher
+    fetcher = EnhancedLiteratureFetcher(config)
+    articles = fetcher.fetch_and_cache(
+        query="broadly neutralizing antibody influenza",
+        max_papers=600,
+        cache_file="data/flu_bnabs_all_articles.json",
+    )
+"""
+
+import json
+import os
+import time
+from typing import Callable, Dict, List, Optional
+
+from .pubmed import PubMedFetcher
+from .pmc_fulltext import PMCFulltextFetcher, UnpaywallFetcher
 
 
 class EnhancedLiteratureFetcher:
     """
-    增强版文献检索器
-    支持多源文献获取：PubMed、PMC 全文、PDF 上传、开放获取链接
+    End-to-end fetcher: PubMed → full-text enrichment → local JSON cache.
     """
-    
-    def __init__(self, config: dict):
+
+    def __init__(self, config: Dict):
         self.config = config
-        self.pubmed_fetcher = PubMedFetcher(
-            email=config["email"],
-            api_key=config.get("pubmed_api_key")
-        )
-        self.pmc_fetcher = PMCFulltextFetcher(
+        self.pubmed = PubMedFetcher(
             email=config["email"],
             api_key=config.get("pubmed_api_key"),
-            output_dir=config.get("pmc_cache_dir", "./data/pmc_cache")
         )
-        self.unpaywall = UnpaywallIntegration(email=config["email"])
-        self.pdf_processor = PDFProcessor()
-        
-    def fetch_with_fulltext(self, query: str, max_papers: int = 50) -> List[Dict]:
+        self.pmc = PMCFulltextFetcher(
+            email=config["email"],
+            delay=config.get("pmc_delay", 0.5),
+        )
+        self.unpaywall = UnpaywallFetcher(
+            email=config["email"],
+            delay=config.get("unpaywall_delay", 0.5),
+        )
+
+    # ── Main public method ────────────────────────────────────────────────────
+    def fetch_and_cache(
+        self,
+        query: str,
+        max_papers: int = 600,
+        cache_file: str = "data/flu_bnabs_all_articles.json",
+        days_back: int = 3650,
+        use_batch: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[Dict]:
         """
-        检索文献并尽可能获取全文
-        优先级：PMC 全文 > Unpaywall OA > PubMed 摘要
+        Run the full pipeline and write results to `cache_file`.
+
+        progress_callback(current, total, stage) — called after each article
+        is enriched so the UI can update a progress bar.
+
+        Returns the enriched article list.
         """
-        # 1. 基础 PubMed 检索
-        pmids = self.pubmed_fetcher.search(query, max_results=max_papers)
-        articles = self.pubmed_fetcher.fetch_details(pmids)
-        
-        # 2. 为每篇文献尝试获取全文
-        enriched_articles = []
-        
-        for article in articles:
-            enriched = article.copy()
-            enriched["fulltext_available"] = False
-            enriched["fulltext_content"] = None
-            enriched["fulltext_source"] = None
-            
-            # 尝试获取 PMCID
-            pmcid = article.get("pmcid")
-            doi = article.get("doi")
-            
-            # 方法1：通过 PMC 获取全文
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+
+        # ── Step 1: PubMed retrieval ──────────────────────────────────────────
+        print(f"[Fetcher] Searching PubMed: {query!r} (max {max_papers})")
+        if use_batch:
+            checkpoint = cache_file.replace(".json", "_checkpoint.json")
+            articles = self.pubmed.fetch_all(
+                query=query,
+                max_results=max_papers,
+                days_back=days_back,
+                checkpoint_file=checkpoint,
+            )
+        else:
+            pmids = self.pubmed.search(
+                query, max_results=max_papers, days_back=days_back
+            )
+            print(f"[Fetcher] Retrieved {len(pmids)} PMIDs")
+            articles = self.pubmed.fetch_details(pmids)
+
+        print(f"[Fetcher] Fetched {len(articles)} article records from PubMed")
+
+        # ── Step 2: Full-text enrichment ──────────────────────────────────────
+        total = len(articles)
+        pmc_hits = 0
+        oa_hits  = 0
+
+        for i, article in enumerate(articles):
+            pmcid = article.get("pmcid", "")
+            doi   = article.get("doi", "")
+
+            # If PubMed XML didn't give us a PMCID, ask Europe PMC
+            if not pmcid and article.get("pmid"):
+                pmcid_found = self.pmc.lookup_pmcid(article["pmid"])
+                if pmcid_found:
+                    article["pmcid"] = pmcid_found
+                    pmcid = pmcid_found
+
+            # Priority 1: PMC full-text XML
+            if pmcid and not article.get("fulltext_available"):
+                print(f"  [{i+1}/{total}] PMC fulltext: {pmcid}")
+                self.pmc.enrich_article(article)
+                if article.get("fulltext_available"):
+                    pmc_hits += 1
+
+            # Priority 2: Unpaywall OA PDF
+            if doi and not article.get("fulltext_available"):
+                print(f"  [{i+1}/{total}] Unpaywall: {doi}")
+                self.unpaywall.enrich_article(article)
+                if article.get("fulltext_available"):
+                    oa_hits += 1
+
+            if not article.get("fulltext_available"):
+                print(f"  [{i+1}/{total}] Abstract only: PMID {article.get('pmid')}")
+
+            if progress_callback:
+                progress_callback(i + 1, total, article.get("pmid", ""))
+
+        print(
+            f"\n[Fetcher] Enrichment complete:\n"
+            f"  Total articles : {total}\n"
+            f"  PMC full text  : {pmc_hits}\n"
+            f"  Unpaywall PDF  : {oa_hits}\n"
+            f"  Abstract only  : {total - pmc_hits - oa_hits}"
+        )
+
+        # ── Step 3: Save to local cache ───────────────────────────────────────
+        self._save_cache(articles, cache_file)
+        return articles
+
+    # ── Cache helpers ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _save_cache(articles: List[Dict], path: str) -> None:
+        """Write articles to JSON, stripping fulltext_content to keep file small
+        if desired. Here we keep it — the content is needed for RAG."""
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(articles, f, indent=2, ensure_ascii=False)
+        size_mb = os.path.getsize(path) / 1_048_576
+        print(f"[Fetcher] Saved {len(articles)} articles → {path} ({size_mb:.1f} MB)")
+
+    @staticmethod
+    def load_cache(path: str) -> List[Dict]:
+        """Load articles from a previously saved JSON cache."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Cache not found: {path}")
+        with open(path, encoding="utf-8") as f:
+            articles = json.load(f)
+        print(f"[Fetcher] Loaded {len(articles)} articles from {path}")
+        return articles
+
+    # ── Convenience: fetch without caching ───────────────────────────────────
+    def fetch_with_fulltext(
+        self,
+        query: str,
+        max_papers: int = 50,
+        days_back: int = 3650,
+    ) -> List[Dict]:
+        """
+        Like fetch_and_cache() but does not write to disk.
+        Useful for on-demand queries from the UI.
+        """
+        pmids = self.pubmed.search(query, max_results=max_papers, days_back=days_back)
+        articles = self.pubmed.fetch_details(pmids)
+        total = len(articles)
+        for i, article in enumerate(articles):
+            pmcid = article.get("pmcid", "")
+            doi   = article.get("doi", "")
+            if not pmcid and article.get("pmid"):
+                found = self.pmc.lookup_pmcid(article["pmid"])
+                if found:
+                    article["pmcid"] = found
+                    pmcid = found
             if pmcid:
-                try:
-                    fulltext = self.pmc_fetcher.search_by_pmcid(pmcid)
-                    if fulltext and fulltext.get("plaintext"):
-                        enriched["fulltext_available"] = True
-                        enriched["fulltext_content"] = fulltext["plaintext"]
-                        enriched["fulltext_source"] = "pmc"
-                        enriched["tables"] = fulltext.get("tables", [])
-                        enriched["markdown"] = fulltext.get("markdown", "")
-                except Exception as e:
-                    print(f"PMC fulltext failed for {pmcid}: {e}")
-            
-            # 方法2：通过 Unpaywall 获取 OA 全文
-            if not enriched["fulltext_available"] and doi:
-                try:
-                    oa_url = self.unpaywall.get_fulltext_url(doi)
-                    if oa_url:
-                        enriched["fulltext_available"] = True
-                        enriched["fulltext_source"] = "unpaywall"
-                        enriched["oa_url"] = oa_url
-                        # 可选：下载并解析 OA PDF
-                except Exception as e:
-                    print(f"Unpaywall lookup failed for {doi}: {e}")
-            
-            enriched_articles.append(enriched)
-        
-        return enriched_articles
-    
-    def process_uploaded_paper(self, pdf_file: BinaryIO, filename: str) -> Dict:
-        """
-        处理用户上传的 PDF 文献
-        提取全文并准备 RAG 索引
-        """
-        # 提取文本和分块
-        chunks = self.pdf_processor.process_uploaded_pdf(pdf_file, filename)
-        
-        # 提取表格
-        tables_md = self.pdf_processor.extract_tables_as_markdown(pdf_file)
-        
-        # 重新打开文件以重置指针（实际使用中需要重新获取文件）
-        # 这里简化处理
-        extracted = self.pdf_processor.extract_text_from_pdf(pdf_file)
-        
-        return {
-            "source": filename,
-            "type": "user_uploaded",
-            "full_text": extracted["full_text"],
-            "chunks": chunks,
-            "tables_markdown": tables_md,
-            "metadata": extracted["metadata"],
-            "text_by_page": extracted["text_by_page"]
-        }
-    
-    def enrich_with_unpaywall_metadata(self, articles: List[Dict]) -> List[Dict]:
-        """
-        使用 Unpaywall 丰富文献元数据
-        包括：开放获取状态、最佳获取链接、许可证等
-        """
-        # 提取所有 DOI
-        dois = [a.get("doi") for a in articles if a.get("doi")]
-        
-        if not dois:
-            return articles
-        
-        # 批量查询 Unpaywall
-        oa_results = self.unpaywall.batch_check(dois)
-        
-        # 丰富每篇文献
-        for article in articles:
-            doi = article.get("doi")
-            if doi and doi in oa_results:
-                oa_info = oa_results[doi]
-                article["open_access"] = {
-                    "is_oa": oa_info.get("is_oa", False),
-                    "oa_status": oa_info.get("oa_status"),
-                    "best_oa_url": oa_info.get("best_oa_location", {}).get("url"),
-                    "license": oa_info.get("license")
-                }
-        
+                self.pmc.enrich_article(article)
+            if doi and not article.get("fulltext_available"):
+                self.unpaywall.enrich_article(article)
+            print(
+                f"  [{i+1}/{total}] {article.get('pmid')} — "
+                f"{'fulltext' if article.get('fulltext_available') else 'abstract'}"
+                f" ({article.get('fulltext_source', 'N/A')})"
+            )
         return articles
